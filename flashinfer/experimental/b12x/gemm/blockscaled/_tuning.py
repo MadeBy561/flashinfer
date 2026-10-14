@@ -229,6 +229,32 @@ def _a16_default_config(query, device):
     )
 
 
+# The A16 warp-MMA kernel converts each MXFP8 weight tile per 16-row M tile, which
+# caps it near 150 TFLOPS on SM120 (BF16 GEMM ~420). From this many rows a prepared
+# A16 call expands the weight into caller scratch once and runs a BF16 GEMM instead.
+MXFP8_A16_DEQUANT_MIN_ROWS = 128
+
+
+def mxfp8_a16_dequant(query, config):
+    """Whether an A16 MXFP8 plan carries the expanded-weight lowering.
+
+    It needs the caller-provided workspace (a plan-owned copy per layer would
+    duplicate the weight in BF16) and an unpadded K.
+    """
+    return (
+        query.recipe == "mxfp8"
+        and config.mode == "a16"
+        and query.workspace_form == "provided"
+        and query.num_tokens >= MXFP8_A16_DEQUANT_MIN_ROWS
+        and query.in_features == query.padded_in_features
+        and (
+            query.workspace_nbytes is None
+            or query.out_features * query.padded_in_features * 2
+            <= query.workspace_nbytes
+        )
+    )
+
+
 def functional_mxfp8_quantization(query, config):
     return (
         query.recipe == "mxfp8"
