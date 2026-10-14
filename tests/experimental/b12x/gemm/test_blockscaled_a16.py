@@ -672,6 +672,23 @@ def test_mxfp8_a16_large_m_expands_weight_into_caller_scratch():
                 )
             else:
                 assert_close(actual, source[:rows].float() @ decoded.T)
+        output = torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with kernel_resolution_guard("A16 MXFP8 expanded-weight capture"):
+                with torch.cuda.graph(graph):
+                    captured = blockscaled.mm(
+                        source, weight, plan=plan, workspace=workspace
+                    )
+                    output.copy_(captured)
+                source.normal_()
+                workspace.fill_(255)
+                output.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+            torch.testing.assert_close(output, source @ dense.T, atol=0, rtol=0)
+        finally:
+            graph.reset()
 
 
 def test_mxfp8_prefill_capacity_owned_and_provided_match():
