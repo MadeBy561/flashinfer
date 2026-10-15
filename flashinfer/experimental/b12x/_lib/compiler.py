@@ -21,11 +21,13 @@ from contextvars import ContextVar
 from threading import RLock
 from types import SimpleNamespace
 from typing import Any
+from filelock import FileLock
 from .cache_integrity import _mkdir_durable, atomic_write_bytes, valid_object
 
 from .compile_plan import _RETAINED_PROGRAMS
 from .runtime_patches import apply_cutlass_runtime_patches
 from .program_cache import register_program_cache
+from .race_fuzz import install_from_environment as _install_race_fuzz
 
 apply_cutlass_runtime_patches()
 
@@ -2535,20 +2537,10 @@ def _ensure_cute_compile_manifest(
 
 @contextmanager
 def _disk_cache_key_lock(cache_key: str):
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
-
     lock_path = _cache_lock_path(cache_key)
     _mkdir_durable(lock_path.parent)
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with FileLock(lock_path):
+        yield
 
 
 def _load_cute_compile_from_disk(cache_key: str):
@@ -2689,6 +2681,8 @@ def compile(
     **kwargs: Any,
 ) -> Any:
     import cutlass.cute as cute
+
+    _install_race_fuzz()
     from .compile_plan import (
         DeferredCuTeKernel,
         ProgramKey,
