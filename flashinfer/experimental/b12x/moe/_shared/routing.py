@@ -48,6 +48,8 @@ def _route_topk_kernel(
         scores = tl.sqrt(
             tl.maximum(logits, 0.0) + libdevice.log1p(tl.exp(-tl.abs(logits)))
         )
+    elif SCORE_FUNC == "sigmoid":
+        scores = tl.sigmoid(logits)
     elif HAS_CORRECTION_BIAS or HAS_IMAGE_BIAS:
         exp_logits = tl.exp(logits - tl.max(logits, axis=0))
         scores = exp_logits / tl.sum(exp_logits, axis=0)
@@ -83,9 +85,9 @@ def _route_topk_kernel(
         remaining = tl.where(eligible, remaining, neg_inf)
 
     topk_logits = tl.gather(logits, topk_ids, axis=0)
-    if SCORE_FUNC == "sqrtsoftplus":
+    if SCORE_FUNC == "sqrtsoftplus" or SCORE_FUNC == "sigmoid":
         topk_weights = tl.where(topk_mask, tl.gather(scores, topk_ids, axis=0), 0.0)
-        if RENORMALIZE and TOP_K > 1:
+        if RENORMALIZE and (TOP_K > 1 or SCORE_FUNC == "sigmoid"):
             topk_weights /= tl.sum(topk_weights, axis=0) + 1e-20
     elif RENORMALIZE:
         masked_logits = tl.where(topk_mask, topk_logits, neg_inf)
@@ -125,7 +127,7 @@ def route_topk(
     """Select experts into caller-owned buffers, breaking ties by larger expert ID.
 
     Correction tensors steer selection but do not alter selected logits. The
-    selected softmax or sqrt-softplus weights receive the scale last.
+    Selected softmax, sigmoid, or sqrt-softplus weights receive the scale last.
     """
     if router_logits.ndim != 2:
         raise ValueError(
@@ -184,8 +186,7 @@ def route_topk(
         return
     block_e = triton.next_power_of_2(num_experts)
     topk_block = triton.next_power_of_2(top_k)
-    launcher = _route_topk_kernel if _launcher is None else _launcher
-    launcher[(num_tokens,)](
+    args = (
         router_logits,
         topk_logits,
         topk_ids,
@@ -202,6 +203,22 @@ def route_topk(
         image_mask.stride(0) if image_mask is not None else 0,
         float(routed_scaling_factor),
         num_experts,
+    )
+    if _launcher is not None:
+        # Compiled Triton launchers take the full positional source signature.
+        _launcher[(num_tokens, 1, 1)](
+            *args,
+            block_e,
+            top_k,
+            topk_block,
+            renormalize,
+            score_func,
+            correction_bias is not None,
+            image_correction_bias is not None and image_mask is not None,
+        )
+        return
+    _route_topk_kernel[(num_tokens,)](
+        *args,
         BLOCK_E=block_e,
         TOP_K=top_k,
         TOPK_BLOCK=topk_block,
@@ -221,7 +238,7 @@ def _validate_score_options(
     image_correction_bias: torch.Tensor | None,
     image_mask: torch.Tensor | None,
 ) -> None:
-    if score_func not in ("softmax", "sqrtsoftplus"):
+    if score_func not in ("softmax", "sqrtsoftplus", "sigmoid"):
         raise ValueError(f"unsupported router score_func: {score_func!r}")
     for name, bias in (
         ("correction_bias", correction_bias),

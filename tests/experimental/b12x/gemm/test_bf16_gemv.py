@@ -15,8 +15,8 @@ cuda_required = pytest.mark.skipif(
 )
 
 
-from b12x.preparation import PreparationSession, PreparedCall
 from b12x.gemm import bf16_gemv
+from b12x.preparation import PreparationSession, PreparedCall
 
 
 @pytest.fixture
@@ -136,6 +136,47 @@ def _assert_matches_f32_ref(y: torch.Tensor, x: torch.Tensor, w: torch.Tensor):
 
 
 @cuda_required
+@pytest.mark.parametrize(
+    "rows,tile", [(65535, 1), (65536, 1), (131073, 2), (524289, 8)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_simt_row_grid_boundary_and_graph_replay(rows, tile, dtype):
+    torch.manual_seed(41)
+    source = torch.randint(-2, 3, (rows, 16), device="cuda").to(dtype)[:, :8]
+    weight = torch.randint(-2, 3, (3, 8), device="cuda").to(dtype)
+    backing = torch.full(
+        (rows + 1, 6), float("nan"), device="cuda", dtype=torch.float32
+    )
+    output = backing[:rows, :3]
+    with PreparationSession(
+        device="cuda", autotune=False, compile_workers=0
+    ) as session:
+        plan = _prepare_projection(
+            session,
+            source,
+            weight,
+            out=output,
+            override=bf16_gemv.GemvConfig(backend="simt", rows_per_tile=tile),
+        )
+        session.freeze()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            bf16_gemv.mm(source, weight, out=output, plan=plan)
+        source.neg_()
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+        torch.testing.assert_close(
+            output, source.float() @ weight.float().T, rtol=0, atol=0
+        )
+        assert (
+            torch.isnan(backing[rows:]).all() and torch.isnan(backing[:rows, 3:]).all()
+        )
+        graph.reset()
+
+
+@cuda_required
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize(
     "n,k", [(64, 5120), (96, 5120), (128, 2048), (112, 1024), (1, 5120)]
@@ -166,21 +207,32 @@ def test_last_element_contributes():
 
 
 @cuda_required
-@pytest.mark.parametrize("n", [32, 384, 512])
+@pytest.mark.parametrize(
+    "n,k", [(32, 5120), (384, 5120), (512, 5120), (288, 4096), (336, 10240)]
+)
+@pytest.mark.parametrize("block_threads", [128, 256])
+@pytest.mark.parametrize("rows_per_tile", [1, 2, 4, 8])
 def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(
-    n, projection_session
+    n, k, block_threads, rows_per_tile, projection_session
 ):
     """Prepared long-K projections retain FP32 output with runtime row counts."""
     from b12x.gemm import bf16_gemv
 
     torch.manual_seed(419132)
-    source = torch.randn(17, 5120, device="cuda").bfloat16() * 0.125
-    weight = torch.randn(n, 5120, device="cuda").bfloat16() * 0.125
+    source = torch.randn(17, k, device="cuda").bfloat16() * 0.125
+    weight = torch.randn(n, k, device="cuda").bfloat16() * 0.125
     bias = torch.linspace(-0.25, 0.25, n, device="cuda")
     storage = torch.full((18, n + 8), 123.0, device="cuda")
     output = storage[:17, :n]
     plan = _prepare_projection(
-        projection_session, source, weight, out=output, bias=bias
+        projection_session,
+        source,
+        weight,
+        out=output,
+        bias=bias,
+        override=bf16_gemv.GemvConfig(
+            backend="simt", block_threads=block_threads, rows_per_tile=rows_per_tile
+        ),
     )
     projection_session.freeze()
     try:
@@ -230,10 +282,12 @@ def test_noncontiguous_x():
         (torch.float32, torch.float32, torch.bfloat16),
     ],
 )
+@pytest.mark.parametrize("block_threads", [128, 256])
 def test_unquantized_bias_and_live_rows_reuse_native_graph(
     input_dtype,
     weight_dtype,
     output_dtype,
+    block_threads,
     projection_session,
 ):
     from b12x.gemm import bf16_gemv
@@ -248,7 +302,12 @@ def test_unquantized_bias_and_live_rows_reuse_native_graph(
     output = torch.empty(capacity, n + 3, device=device, dtype=output_dtype)
 
     plan = _prepare_projection(
-        projection_session, source, weight, bias=bias, out=output[:, :n]
+        projection_session,
+        source,
+        weight,
+        bias=bias,
+        out=output[:, :n],
+        override=bf16_gemv.GemvConfig(backend="simt", block_threads=block_threads),
     )
 
     def launch(rows):
@@ -527,7 +586,20 @@ def test_prefill_projection_retains_small_terms_between_cancelling_large_terms(n
 
 @cuda_required
 @pytest.mark.parametrize("m", [1, 2, 3, 8])
-@pytest.mark.parametrize("n,k", [(4096, 2048), (2560, 4096), (8192, 4096), (1040, 512)])
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (4096, 2048),
+        (2560, 4096),
+        (8192, 4096),
+        (1040, 512),
+        (10240, 320),
+        (257, 64),
+        (31, 192),
+        (513, 448),
+        (257, 576),
+    ],
+)
 def test_tensor_core_gemv_matches_fp64_reference(m, n, k):
     """Wide decode projections: one FP32 accumulation and one BF16 rounding."""
     torch.manual_seed(m * 131 + n + k)
@@ -544,7 +616,8 @@ def test_tensor_core_gemv_matches_fp64_reference(m, n, k):
 
 
 @cuda_required
-def test_tensor_core_gemv_replays_live_rows():
+@pytest.mark.parametrize("k", [320, 576, 2048])
+def test_tensor_core_gemv_replays_live_rows(k):
     """One tc plan prepared at eight rows serves CUDA-graph replays with fewer live
     rows: each replay matches FP64, leaves rows past the live count untouched and
     allocates nothing."""
@@ -552,7 +625,7 @@ def test_tensor_core_gemv_replays_live_rows():
     from b12x.preparation import require_prepared
 
     torch.manual_seed(7)
-    k, n = 2048, 4096
+    n = 4096
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
     x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
     out = torch.full((8, n), float("nan"), device="cuda", dtype=torch.bfloat16)

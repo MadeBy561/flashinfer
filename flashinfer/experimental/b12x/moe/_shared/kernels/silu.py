@@ -76,6 +76,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         mma_tiler_mn: Tuple[int, int],
         *,
         fast_math: bool = False,
+        mma_warps: int | None = None,
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
         deterministic_output: bool = False,
@@ -83,7 +84,6 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         swap_ab: bool = False,
         separate_w13_halves: bool = False,
         quant_recipe: str = "nvfp4",
-        nvfp4_inline_scales: bool = False,
         w4a8_repacked: bool = False,
         w4a8_n64_repacked: bool = False,
         w4a8_n64_tail: bool = False,
@@ -98,12 +98,12 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         swiglu_beta: float | None = None,
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
-        w4a8_csf_inline: bool = False,
     ):
         super().__init__(
             sf_vec_size,
             mma_tiler_mn,
             fast_math=fast_math,
+            mma_warps=mma_warps,
             activation="silu",
             dynamic_down_scale=dynamic_down_scale,
             share_input_across_experts=share_input_across_experts,
@@ -112,7 +112,6 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             swap_ab=swap_ab,
             separate_w13_halves=separate_w13_halves,
             quant_recipe=quant_recipe,
-            nvfp4_inline_scales=nvfp4_inline_scales,
             w4a8_repacked=w4a8_repacked,
             w4a8_n64_repacked=w4a8_n64_repacked,
             w4a8_n64_tail=w4a8_n64_tail,
@@ -127,7 +126,6 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             swiglu_beta=swiglu_beta,
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
-            w4a8_csf_inline=w4a8_csf_inline,
         )
 
 

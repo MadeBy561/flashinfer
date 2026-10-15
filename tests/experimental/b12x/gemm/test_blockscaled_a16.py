@@ -255,7 +255,16 @@ def test_a16_aot_compile_functionalizes_workspace(recipe, allocated, functionali
             assert_close(compiled(source), source.float() @ decoded.T)
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "recipe,tile_n,mma_warps",
+    [
+        ("nvfp4", 64, None),
+        ("mxfp8", 64, 2),
+        ("mxfp8", 64, 4),
+        ("mxfp8", 128, 2),
+        ("mxfp8", 128, 4),
+    ],
+)
 @pytest.mark.parametrize(
     "m,n,k",
     [
@@ -268,12 +277,14 @@ def test_a16_aot_compile_functionalizes_workspace(recipe, allocated, functionali
     ],
 )
 @pytest.mark.parametrize("split", [1, 2, 4, 8])
-def test_a16_reference(recipe, m, n, k, split):
+def test_a16_reference(recipe, tile_n, mma_warps, m, n, k, split):
     require_b12x()
     weight, decoded, _ = make_weight(recipe, n, k)
     source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     output = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
-    config = BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=split)
+    config = BlockscaledConfig(
+        mode="a16", tile_n=tile_n, tile_k=64, split_k=split, mma_warps=mma_warps
+    )
     provisional = blockscaled.query_from_call(
         source, weight, activation_mode="a16", out=output, expected_m=m
     )
@@ -299,6 +310,69 @@ def test_a16_reference(recipe, m, n, k, split):
         assert actual.data_ptr() == output.data_ptr()
         assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
         assert_close(actual, source.float() @ decoded.T)
+
+
+@pytest.mark.parametrize(
+    "recipe,tile_n,mma_warps",
+    [
+        ("nvfp4", 64, None),
+        ("mxfp8", 64, 2),
+        ("mxfp8", 64, 4),
+        ("mxfp8", 128, 2),
+        ("mxfp8", 128, 4),
+    ],
+)
+@pytest.mark.parametrize("split", [1, 4])
+def test_a16_graph_replay_with_concurrent_memory_traffic(
+    recipe, tile_n, mma_warps, split
+):
+    require_b12x()
+    source = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
+    weight, decoded, _ = make_weight(recipe, 2048, 4096)
+    output = torch.empty(8, 2048, device="cuda", dtype=torch.bfloat16)
+    config = BlockscaledConfig(
+        mode="a16",
+        tile_m=16,
+        tile_n=tile_n,
+        tile_k=64,
+        split_k=split,
+        mma_warps=mma_warps,
+    )
+    workspace = make_workspace(
+        source, weight, activation_mode="a16", out=output, config=config
+    )
+    traffic = torch.zeros(256 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    destination = torch.empty_like(traffic)
+    auxiliary = torch.cuda.Stream()
+
+    with prepared_execution(
+        source,
+        weight,
+        activation_mode="a16",
+        out=output,
+        workspace=workspace,
+        config=config,
+    ) as (_, plan):
+        blockscaled.mm(source, weight, out=output, workspace=workspace, plan=plan)
+        assert_close(output, source.float() @ decoded.T)
+        expected = output.clone()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            capture_stream = torch.cuda.current_stream()
+            auxiliary.wait_stream(capture_stream)
+            with torch.cuda.stream(auxiliary):
+                blockscaled.mm(
+                    source, weight, out=output, workspace=workspace, plan=plan
+                )
+            destination.copy_(traffic)
+            capture_stream.wait_stream(auxiliary)
+        try:
+            for _ in range(128):
+                graph.replay()
+                torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        finally:
+            graph.reset()
 
 
 @pytest.mark.parametrize("kind", ["multiplier", "reciprocal"])
