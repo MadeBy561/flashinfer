@@ -653,6 +653,16 @@ def test_mxfp8_a16_large_m_expands_weight_into_caller_scratch():
         workspace=workspace,
     )
     assert not _tuning.mxfp8_a16_dequant(short, config)
+    huge = replace(
+        short,
+        num_tokens=capacity,
+        out_features=_tuning.MXFP8_A16_DEQUANT_MAX_BYTES // (2 * 8192) + 8,
+        in_features=8192,
+        padded_in_features=8192,
+        workspace_nbytes=None,
+    )
+    assert not _tuning.mxfp8_a16_dequant(huge, config)
+    assert _tuning.mxfp8_a16_dequant(replace(huge, out_features=8), config)
     with prepared_execution(
         source,
         weight,
