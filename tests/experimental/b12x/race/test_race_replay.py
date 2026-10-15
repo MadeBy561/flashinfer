@@ -1,12 +1,14 @@
-"""b12x kernels must replay bit-exactly while other work perturbs their timing.
+"""b12x kernels must give sound results while other work perturbs their timing.
 
-Each scenario (see ``scenarios.py``) is captured in a CUDA graph, its first
-replay becomes the reference, quiet replays must reproduce it, and then every
-replay under ``SMContention`` must reproduce it too. A difference in any bit
-means the kernel's result depends on CTA or warp timing: a missing fence,
-barrier release or CTA-wide sync. The b12x dense GEMM stage-reuse race
-(local-inference-lab/flashinfer#16) fails about 1-4% of such replays on
-GB10, RTX PRO 4000 and RTX PRO 6000 when its fence is removed.
+Each scenario (see ``scenarios/``) is captured in a CUDA graph and its first
+replay becomes the reference. Quiet replays calibrate how far arithmetic order
+alone moves each output (b12x is not deterministic, and need not be); every
+replay under ``SMContention`` must then stay within a margin of that spread
+(see ``replay.py``). Values outside it mean the kernel's result depends on CTA
+or warp timing: a missing fence, barrier release or CTA-wide sync. The b12x
+dense GEMM stage-reuse race (local-inference-lab/flashinfer#16) puts about
+1-4% of such replays outside it on GB10, RTX PRO 4000 and RTX PRO 6000 when
+its fence is removed.
 
 Budgets and modes:
 
@@ -69,7 +71,9 @@ def _check(family, case, contention):
             family,
             case,
             id=f"{family}-{index}",
-            marks=pytest.mark.xfail(strict=True, reason=case["xfail"]) if "xfail" in case else (),
+            marks=pytest.mark.xfail(strict=True, reason=case["xfail"])
+            if "xfail" in case
+            else (),
         )
         for family, cases in scenarios.CASES.items()
         for index, case in enumerate(cases)

@@ -12,8 +12,9 @@ The mutated module is loaded before anything imports b12x, here and in b12x's
 spawned compile workers (which re-import this module as their main module).
 ``B12X_RACE_MUTATION`` names the active mutation; like every non-operational
 ``B12X_`` variable it is part of the compile cache key, so mutated kernels
-never share cache entries with real ones. Set ``B12X_RACE_FUZZ_DELAY`` too for
-mutations listed with ``delay``.
+never share cache entries with real ones. Mutations listed with ``delay`` also
+run with ``B12X_RACE_FUZZ_DELAY``; ``noise`` passes keyword arguments to
+``SMContention`` (for example ``{"store_percent": 50}``).
 """
 
 from __future__ import annotations
@@ -98,7 +99,7 @@ def _child(name: str, replays: int) -> dict:
 
     device = require_b12x()
     spec = MUTATIONS[name]
-    contention = SMContention(device)
+    contention = SMContention(device, **spec.get("noise", {}))
     results = []
     for case in spec["cases"]:
         scenario = scenarios.FAMILIES[spec["family"]](device, case)
@@ -154,7 +155,7 @@ def main(argv: list[str]) -> int:
         caught = any(r["bad"] for r in result["results"])
         for r in result["results"]:
             print(
-                f"{name} on {result['device']}: {r['description']}: {r['bad']} of {r['replays']} replays differ"
+                f"{name} on {result['device']}: {r['description']}: {r['bad']} of {r['replays']} replays out of tolerance"
             )
         print(f"{name}: {'caught' if caught else 'MISSED'}")
         if not caught:

@@ -19,6 +19,7 @@ pending test CTAs as SMs drain. The kernels are CuTe DSL; no nvcc is needed.
 
 from __future__ import annotations
 
+import dataclasses
 import random
 import threading
 from dataclasses import dataclass
@@ -49,7 +50,8 @@ def _words_storage(words: int):
 
 class _Hog:
     """Spin for ``ns`` on %globaltimer holding ``smem_words`` of shared memory;
-    with ``touch``, stream random 8-byte loads over ``buf``."""
+    with ``touch`` 1, stream random 8-byte loads over ``buf``; with 2, random
+    8-byte stores (write-back pressure on L2 and DRAM)."""
 
     def __init__(self, threads: int, smem_words: int):
         self.threads, self.smem_words = threads, smem_words
@@ -84,7 +86,11 @@ class _Hog:
             if touch != Int32(0):
                 for _ in cutlass.range_constexpr(4):
                     x = x * Int64(_LCG_MUL) + Int64(_LCG_ADD)
-                    acc += buf[Int32((x >> 17) & Int64(0x7FFFFFFF)) % words]
+                    index = Int32((x >> 17) & Int64(0x7FFFFFFF)) % words
+                    if touch == Int32(2):
+                        buf[index] = x
+                    else:
+                        acc += buf[index]
         if acc == Int64(0x5555555555555555):
             buf[0] = acc + held[(tid ^ 1) % self.smem_words]
 
@@ -142,6 +148,7 @@ class SMContention:
         max_us: int = 400,
         max_gap_us: int = 300,
         touch_percent: int = 50,
+        store_percent: int = 0,
         skew_percent: int = 25,
         schedules: int = 6,
         launches_per_schedule: int = 48,
@@ -172,7 +179,13 @@ class SMContention:
         for _ in range(schedules):
             plan = [
                 self._random_launch(
-                    rng, full_words, max_us, max_gap_us, touch_percent, skew_percent
+                    rng,
+                    full_words,
+                    max_us,
+                    max_gap_us,
+                    touch_percent,
+                    store_percent,
+                    skew_percent,
                 )
                 for _ in range(launches_per_schedule)
             ]
@@ -195,7 +208,7 @@ class SMContention:
             Int32(0),
             self._cu_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "test.race.hog", 1, (threads, words)
+                "test.race.hog", 2, (threads, words)
             ),
         )
 
@@ -213,7 +226,14 @@ class SMContention:
         return cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
 
     def _random_launch(
-        self, rng, full_words, max_us, max_gap_us, touch_percent, skew_percent
+        self,
+        rng,
+        full_words,
+        max_us,
+        max_gap_us,
+        touch_percent,
+        store_percent,
+        skew_percent,
     ):
         roll = rng.randrange(100)
         if roll < 15:
@@ -228,7 +248,7 @@ class SMContention:
             )
         threads = rng.choice((256, 1024))
         words = full_words if rng.randrange(3) else threads
-        return _Launch(
+        launch = _Launch(
             "hog",
             ("hog", threads, words),
             1 + rng.randrange(2 * self.sms),
@@ -236,6 +256,10 @@ class SMContention:
             rng.getrandbits(62),
             int(rng.randrange(100) < touch_percent),
         )
+        # Draw only when stores are enabled, so default schedules stay unchanged.
+        if store_percent and launch.touch and rng.randrange(100) < store_percent:
+            launch = dataclasses.replace(launch, touch=2)
+        return launch
 
     def _issue(self, launch):
         kernel = self._kernels[launch.variant]
